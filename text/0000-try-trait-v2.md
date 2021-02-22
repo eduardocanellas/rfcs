@@ -7,7 +7,7 @@
 [summary]: #summary
 
 Replace [RFC #1859, `try_trait`](https://rust-lang.github.io/rfcs/1859-try-trait.html),
-with a new design for the currently-unstable [`Try` trait](https://doc.rust-lang.org/nightly/std/ops/trait.Try.html)
+with a new design for the currently-unstable [`EarlyExit` trait](https://doc.rust-lang.org/nightly/std/ops/trait.EarlyExit.html)
 and corresponding desugaring for the `?` operator.
 
 The new design supports all the currently-stable conversions (including the accidental ones),
@@ -75,9 +75,9 @@ impl<T> TreeNode<T> {
 <!-- https://play.rust-lang.org/?version=nightly&mode=debug&edition=2018&gist=286ac85c43e5bf242b5431b4f6f63386 -->
 
 
-## The `Try` trait
+## The `EarlyExit` trait
 
-The `ops::Try` trait describes a type's behavior when used with the `?` operator, like how the `ops::Add` trait describes its behavior when used with the `+` operator.
+The `ops::EarlyExit` trait describes a type's behavior when used with the `?` operator, like how the `ops::Add` trait describes its behavior when used with the `+` operator.
 
 At its core, the `?` operator is about splitting a type into its two parts:
 
@@ -86,19 +86,19 @@ At its core, the `?` operator is about splitting a type into its two parts:
 
 (Oxford's definition for a residual is "a quantity remaining after other things have been subtracted or allowed for", thus the use here.)
 
-The `Try` trait also has facilities for rebuilding a type from either of its parts.  This is needed to build the final return value from a function, both in `?` and in methods generic over multiple types implementing `Try`.
+The `EarlyExit` trait also has facilities for rebuilding a type from either of its parts.  This is needed to build the final return value from a function, both in `?` and in methods generic over multiple types implementing `EarlyExit`.
 
-Here's a quick overview of a few standard types which implement `Try`, their corresponding output and residual types, and the functions which convert between them.
+Here's a quick overview of a few standard types which implement `EarlyExit`, their corresponding output and residual types, and the functions which convert between them.
 (Full details will come later; the goal for now is just to get the general idea.)
 
 ```text
-+-------------+                             +-------------------+                          +-------------------+
-| Try::Output |                             |      Try Type     |                          |   Try::Residual   |
-+-------------+   Try::branch is Continue   +-------------------+   Try::branch is Break   +-------------------+
-|      T      |  <------------------------  |   Result<T, E>    |  --------------------->  |   Result<!, E>    |
-|      T      |                             |     Option<T>     |                          |     Option<!>     |
-|      C      |  ------------------------>  | ControlFlow<B, C> |  <---------------------  | ControlFlow<B, !> |
-+-------------+      Try::from_output       +-------------------+    Try::from_residual    +-------------------+
++----------------------+                                 +-------------------------+                              +-----------------------+
+| EarlyExit::Remainder |                                 |      EarlyExit Type     |                              |   EarlyExit::Return   |
++----------------------+   EarlyExit::branch is Continue +-------------------------+   EarlyExit::branch is Break +-----------------------+
+|           T          |  <----------------------------  |      Result<T, E>       |  ------------------------->  |     Result<!, E>      |
+|           T          |                                 |        Option<T>        |                              |       Option<!>       |
+|           C          |  ---------------------------->  |    ControlFlow<B, C>    |  <-------------------------  |   ControlFlow<B, !>   |
++----------------------+      EarlyExit::from_remainder  +-------------------------+    EarlyExit::from_return    +-----------------------+
 ```
 
 If you've used `?`-on-`Result` before, that output type is likely unsurprising.  Since it's given out directly from the operator, there's not much of a choice.
@@ -111,7 +111,7 @@ Most importantly, this gives each family of types (`Result`s, `Option`s, `Contro
 >
 > This is the most critical semantic difference.  Structurally this definition of the trait is very similar to the previous -- there's still a method splitting the type into a discriminated union between two associated types, and constructors to rebuild it from them.  But by keeping the "result-ness" or "option-ness" in the residual type, it gives extra control over interconversion that wasn't possible before.  The changes other than this are comparatively minor, typically either rearrangements to work with that or renamings to change the vocabulary used in the trait.
 
-Using `!` is then just a convenient yet efficient way to create those residual types.  It's nice as a user, too, not to need to understand an additional type.  Just the same "it can't be that one" pattern that's also used in `TryFrom`, where for example `i32::try_from(10_u8)` gives a `Result<i32, !>`, since it's a widening conversion which cannot fail.  Note that there's nothing special going on with `!` here -- any uninhabited `enum` would work fine.
+Using `!` is then just a convenient yet efficient way to create those residual types.  It's nice as a user, too, not to need to understand an additional type.  Just the same "it can't be that one" pattern that's also used in `EarlyExitFrom`, where for example `i32::try_from(10_u8)` gives a `Result<i32, !>`, since it's a widening conversion which cannot fail.  Note that there's nothing special going on with `!` here -- any uninhabited `enum` would work fine.
 
 
 ## How error conversion works
@@ -119,31 +119,31 @@ Using `!` is then just a convenient yet efficient way to create those residual t
 One thing [The Book mentions](https://doc.rust-lang.org/stable/book/ch09-02-recoverable-errors-with-result.html#a-shortcut-for-propagating-errors-the--operator),
 if you recall, is that error values in `?` have `From::from` called on them, to convert from one error type to another.
 
-The previous section actually lied to you slightly: there are *two* traits involved, not just one.  The `from_residual` method is on `FromTryResidual`, which is generic so that the implementation on `Result` can add that extra conversion.  Specifically, the trait looks like this:
+The previous section actually lied to you slightly: there are *two* traits involved, not just one.  The `from_return` method is on `FromReturn`, which is generic so that the implementation on `Result` can add that extra conversion.  Specifically, the trait looks like this:
 
 ```rust
-trait FromTryResidual<Residual = <Self as Try>::Residual> {
-	fn from_residual(r: Residual) -> Self;
+trait FromReturn<Return = <Self as EarlyExit>::Return> {
+	fn from_return(r: Return) -> Self;
 }
 ```
 
-And while we're showing code, here's the exact definition of the `Try` trait:
+And while we're showing code, here's the exact definition of the `EarlyExit` trait:
 
 ```rust
-trait Try: FromTryResidual {
-	type Output;
-	type Residual;
-	fn branch(self) -> ControlFlow<Self::Residual, Self::Output>;
-	fn from_output(o: Self::Output) -> Self;
+trait EarlyExit: FromReturn {
+	type Remainder;
+	type Return;
+	fn branch(self) -> ControlFlow<Self::Return, Self::Remainder>;
+	fn from_remainder(o: Self::Remainder) -> Self;
 }
 ```
 
-The fact that it's a super-trait like that is why I don't feel bad about the slight lie: Every `T: Try` *always* has a `from_residual` function from `T::Residual` to `T`.  It's just that some types might offer more.
+The fact that it's a super-trait like that is why I don't feel bad about the slight lie: Every `T: EarlyExit` *always* has a `from_return` function from `T::Return` to `T`.  It's just that some types might offer more.
 
 Here's how `Result` implements it to do error-conversions:
 ```rust
-impl<T, E, F: From<E>> FromTryResidual<Result<!, E>> for Result<T, F> {
-    fn from_residual(x: Result<!, E>) -> Self {
+impl<T, E, F: From<E>> FromReturn<Result<!, E>> for Result<T, F> {
+    fn from_return(x: Result<!, E>) -> Self {
         match x {
             Err(e) => Err(From::from(e)),
         }
@@ -154,8 +154,8 @@ impl<T, E, F: From<E>> FromTryResidual<Result<!, E>> for Result<T, F> {
 But `Option` doesn't need to do anything exciting, so just has a simple implementation, taking advantage of the default parameter:
 
 ```rust
-impl<T> FromTryResidual for Option<T> {
-    fn from_residual(x: Self::Residual) -> Self {
+impl<T> FromReturn for Option<T> {
+    fn from_return(x: Self::Return) -> Self {
         match x {
             None => None,
         }
@@ -170,7 +170,7 @@ In your own types, it's up to you to decide how much freedom is appropriate.  Yo
 > This is another notable difference: The `From::from` is up to the trait implementation, not part of the desugaring.
 
 
-## Implementing `Try` for a non-generic type
+## Implementing `EarlyExit` for a non-generic type
 
 The examples in the standard library are all generic, so serve as good examples of that, but non-generic implementations are also possible.
 
@@ -184,38 +184,38 @@ impl ResultCode {
 }
 ```
 
-We can implement `Try` for that type to simplify the code without changing the error model.
+We can implement `EarlyExit` for that type to simplify the code without changing the error model.
 
 First, we'll need a residual type.  We can make this a simple newtype, and conveniently there's a type with a niche for exactly the value that this can't hold.  This is only used inside the desugaring, so we can leave it opaque -- nobody but us will need to create or inspect it.
 ```rust
 use std::num::NonZeroI32;
-pub struct ResultCodeResidual(NonZeroI32);
+pub struct ResultCodeReturn(NonZeroI32);
 ```
 
-With that, it's straight-forward to implement the traits.  `NonZeroI32`'s constructor even does exactly the check we need in `Try::branch`:
+With that, it's straight-forward to implement the traits.  `NonZeroI32`'s constructor even does exactly the check we need in `EarlyExit::branch`:
 ```rust
-impl Try for ResultCode {
-    type Output = ();
-    type Residual = ResultCodeResidual;
-    fn branch(self) -> ControlFlow<Self::Residual> {
+impl EarlyExit for ResultCode {
+    type Remainder = ();
+    type Return = ResultCodeReturn;
+    fn branch(self) -> ControlFlow<Self::Return> {
         match NonZeroI32::new(self.0) {
-            Some(r) => ControlFlow::Break(ResultCodeResidual(r)),
+            Some(r) => ControlFlow::Break(ResultCodeReturn(r)),
             None => ControlFlow::Continue(()),
         }
     }
-    fn from_output((): ()) -> Self {
+    fn from_remainder((): ()) -> Self {
         ResultCode::SUCCESS
     }
 }
 
-impl FromTryResidual for ResultCode {
-    fn from_residual(r: ResultCodeResidual) -> Self {
+impl FromReturn for ResultCode {
+    fn from_return(r: ResultCodeReturn) -> Self {
         ResultCode(r.0.into())
     }
 }
 ```
 
-Aside: As a nice bonus, the use of a `NonZero` type in the residual means that `<ResultCode as Try>::branch` [compiles down to a nop](https://rust.godbolt.org/z/GxeYax) on the current nightly.  Thanks, enum layout optimizations!
+Aside: As a nice bonus, the use of a `NonZero` type in the residual means that `<ResultCode as EarlyExit>::branch` [compiles down to a nop](https://rust.godbolt.org/z/GxeYax) on the current nightly.  Thanks, enum layout optimizations!
 
 Now, this is all great for keeping the interface that the other unmigrated C code expects, and can even work in `no_std` if we want.  But it might also be nice to give other *Rust* code that uses it the option to convert things into a `Result` with a more detailed error.
 
@@ -229,8 +229,8 @@ pub struct FancyError(String);
 
 We can allow `?` on a `ResultCode` in a method returning `Result` with an implementation like this:
 ```rust
-impl<T, E: From<FancyError>> FromTryResidual<ResultCodeResidual> for Result<T, E> {
-    fn from_residual(r: ResultCodeResidual) -> Self {
+impl<T, E: From<FancyError>> FromReturn<ResultCodeReturn> for Result<T, E> {
+    fn from_return(r: ResultCodeReturn) -> Self {
         Err(FancyError(format!("Something fancy about {} at {:?}", r.0, std::time::SystemTime::now())).into())
     }
 }
@@ -261,7 +261,7 @@ So instead of `f` returning just an `A`, we'll need it to return some other type
 
 Let's add a new generic parameter `R` for that type, and bound it to the output type that we want:
 ```rust
-fn simple_try_fold_1<A, T, R: Try<Output = A>>(
+fn simple_try_fold_1<A, T, R: EarlyExit<Remainder = A>>(
     iter: impl Iterator<Item = T>,
     mut accum: A,
     mut f: impl FnMut(A, T) -> R,
@@ -270,9 +270,9 @@ fn simple_try_fold_1<A, T, R: Try<Output = A>>(
 }
 ```
 
-`Try` is also the trait we need to get the updated accumulator from `f`'s return value and return the result if we manage to get through the entire iterator:
+`EarlyExit` is also the trait we need to get the updated accumulator from `f`'s return value and return the result if we manage to get through the entire iterator:
 ```rust
-fn simple_try_fold_2<A, T, R: Try<Output = A>>(
+fn simple_try_fold_2<A, T, R: EarlyExit<Remainder = A>>(
     iter: impl Iterator<Item = T>,
     mut accum: A,
     mut f: impl FnMut(A, T) -> R,
@@ -284,13 +284,13 @@ fn simple_try_fold_2<A, T, R: Try<Output = A>>(
             ControlFlow::Break(_) => todo!(),
         }
     }
-    R::from_output(accum)
+    R::from_remainder(accum)
 }
 ```
 
-We'll also need `FromTryResidual::from_residual` to turn the residual back into the original type.  But because it's a supertrait of `Try`, we don't need to mention it in the bounds.  All types which implement `Try` can always be recreated from their corresponding residual, so we'll just call it:
+We'll also need `FromReturn::from_return` to turn the residual back into the original type.  But because it's a supertrait of `EarlyExit`, we don't need to mention it in the bounds.  All types which implement `EarlyExit` can always be recreated from their corresponding residual, so we'll just call it:
 ```rust
-pub fn simple_try_fold_3<A, T, R: Try<Output = A>>(
+pub fn simple_try_fold_3<A, T, R: EarlyExit<Remainder = A>>(
     iter: impl Iterator<Item = T>,
     mut accum: A,
     mut f: impl FnMut(A, T) -> R,
@@ -299,16 +299,16 @@ pub fn simple_try_fold_3<A, T, R: Try<Output = A>>(
         let cf = f(accum, x).branch();
         match cf {
             ControlFlow::Continue(a) => accum = a,
-            ControlFlow::Break(r) => return R::from_residual(r),
+            ControlFlow::Break(r) => return R::from_return(r),
         }
     }
-    R::from_output(accum)
+    R::from_remainder(accum)
 }
 ```
 
 But this "call `branch`, then `match` on it, and `return` if it was a `Break`" is exactly what happens inside the `?` operator.  So rather than do all this manually, we can just use `?` instead:
 ```rust
-fn simple_try_fold<A, T, R: Try<Output = A>>(
+fn simple_try_fold<A, T, R: EarlyExit<Remainder = A>>(
     iter: impl Iterator<Item = T>,
     mut accum: A,
     mut f: impl FnMut(A, T) -> R,
@@ -316,7 +316,7 @@ fn simple_try_fold<A, T, R: Try<Output = A>>(
     for x in iter {
         accum = f(accum, x)?;
     }
-    R::from_output(accum)
+    R::from_remainder(accum)
 }
 ```
 
@@ -351,25 +351,25 @@ pub enum ControlFlow<B, C = ()> {
 ## The traits
 
 ```rust
-pub trait Try: FromTryResidual {
+pub trait EarlyExit: FromReturn {
     /// The type of the value consumed or produced when not short-circuiting.
-    type Output;
+    type Remainder;
 
     /// A type that "colours" the short-circuit value so it can stay associated
     /// with the type constructor from which it came.
-    type Residual;
+    type Return;
 
     /// Used in `try{}` blocks to wrap the result of the block.
-    fn from_output(x: Self::Output) -> Self;
+    fn from_remainder(x: Self::Remainder) -> Self;
 
     /// Determine whether to short-circuit (by returning `ControlFlow::Break`)
     /// or continue executing (by returning `ControlFlow::Continue`).
-    fn branch(self) -> ControlFlow<Self::Residual, Self::Output>;
+    fn branch(self) -> ControlFlow<Self::Return, Self::Remainder>;
 }
 
-pub trait FromTryResidual<Residual = <Self as Try>::Residual> {
-    /// Recreate the type implementing `Try` from a related residual
-    fn from_residual(x: Residual) -> Self;
+pub trait FromReturn<Return = <Self as EarlyExit>::Return> {
+    /// Recreate the type implementing `EarlyExit` from a related residual
+    fn from_return(x: Return) -> Self;
 }
 ```
 
@@ -378,18 +378,18 @@ pub trait FromTryResidual<Residual = <Self as Try>::Residual> {
 The previous desugaring of `x?` was
 
 ```rust
-match Try::into_result(x) {
+match EarlyExit::into_result(x) {
 	Ok(v) => v,
-	Err(e) => return Try::from_error(From::from(e)),
+	Err(e) => return EarlyExit::from_error(From::from(e)),
 }
 ```
 
 The new one is very similar:
 
 ```rust
-match Try::branch(x) {
+match EarlyExit::branch(x) {
 	ControlFlow::Continue(v) => v,
-	ControlFlow::Break(r) => return FromTryResidual::from_residual(r),
+	ControlFlow::Break(r) => return FromReturn::from_return(r),
 }
 ```
 
@@ -400,17 +400,17 @@ It's just left conversion (such as `From::from`) up to the implementation instea
 ### `Result`
 
 ```rust
-impl<T, E> ops::Try for Result<T, E> {
-    type Output = T;
-    type Residual = Result<!, E>;
+impl<T, E> ops::EarlyExit for Result<T, E> {
+    type Remainder = T;
+    type Return = Result<!, E>;
 
     #[inline]
-    fn from_output(c: T) -> Self {
+    fn from_remainder(c: T) -> Self {
         Ok(c)
     }
 
     #[inline]
-    fn branch(self) -> ControlFlow<Self::Residual, T> {
+    fn branch(self) -> ControlFlow<Self::Return, T> {
         match self {
             Ok(c) => ControlFlow::Continue(c),
             Err(e) => ControlFlow::Break(Err(e)),
@@ -418,8 +418,8 @@ impl<T, E> ops::Try for Result<T, E> {
     }
 }
 
-impl<T, E, F: From<E>> ops::FromTryResidual<Result<!, E>> for Result<T, F> {
-    fn from_residual(x: Result<!, E>) -> Self {
+impl<T, E, F: From<E>> ops::FromReturn<Result<!, E>> for Result<T, F> {
+    fn from_return(x: Result<!, E>) -> Self {
         match x {
             Err(e) => Err(From::from(e)),
         }
@@ -430,17 +430,17 @@ impl<T, E, F: From<E>> ops::FromTryResidual<Result<!, E>> for Result<T, F> {
 ### `Option`
 
 ```rust
-impl<T> ops::Try for Option<T> {
-    type Output = T;
-    type Residual = Option<!>;
+impl<T> ops::EarlyExit for Option<T> {
+    type Remainder = T;
+    type Return = Option<!>;
 
     #[inline]
-    fn from_output(c: T) -> Self {
+    fn from_remainder(c: T) -> Self {
         Some(c)
     }
 
     #[inline]
-    fn branch(self) -> ControlFlow<Self::Residual, T> {
+    fn branch(self) -> ControlFlow<Self::Return, T> {
         match self {
             Some(c) => ControlFlow::Continue(c),
             None => ControlFlow::Break(None),
@@ -448,8 +448,8 @@ impl<T> ops::Try for Option<T> {
     }
 }
 
-impl<T> ops::FromTryResidual for Option<T> {
-    fn from_residual(x: <Self as ops::Try>::Residual) -> Self {
+impl<T> ops::FromReturn for Option<T> {
+    fn from_return(x: <Self as ops::EarlyExit>::Return) -> Self {
         match x {
             None => None,
         }
@@ -459,18 +459,18 @@ impl<T> ops::FromTryResidual for Option<T> {
 
 ### `Poll`
 
-These reuse `Result`'s residual type, and thus interconversion between `Poll` and `Result` is allowed without needing additional `FromTryResidual` implementations on `Result`.
+These reuse `Result`'s residual type, and thus interconversion between `Poll` and `Result` is allowed without needing additional `FromReturn` implementations on `Result`.
 
 ```rust
-impl<T, E> ops::Try for Poll<Result<T, E>> {
-    type Output = Poll<T>;
-    type Residual = <Result<T, E> as ops::Try>::Residual;
+impl<T, E> ops::EarlyExit for Poll<Result<T, E>> {
+    type Remainder = Poll<T>;
+    type Return = <Result<T, E> as ops::EarlyExit>::Return;
 
-    fn from_output(c: Self::Output) -> Self {
+    fn from_remainder(c: Self::Remainder) -> Self {
         c.map(Ok)
     }
 
-    fn branch(self) -> ControlFlow<Self::Residual, Self::Output> {
+    fn branch(self) -> ControlFlow<Self::Return, Self::Remainder> {
         match self {
             Poll::Ready(Ok(x)) => ControlFlow::Continue(Poll::Ready(x)),
             Poll::Ready(Err(e)) => ControlFlow::Break(Err(e)),
@@ -479,8 +479,8 @@ impl<T, E> ops::Try for Poll<Result<T, E>> {
     }
 }
 
-impl<T, E, F: From<E>> ops::FromTryResidual<Result<!, E>> for Poll<Result<T, F>> {
-    fn from_residual(x: Result<!, E>) -> Self {
+impl<T, E, F: From<E>> ops::FromReturn<Result<!, E>> for Poll<Result<T, F>> {
+    fn from_return(x: Result<!, E>) -> Self {
         match x {
             Err(e) => Poll::Ready(Err(From::from(e))),
         }
@@ -489,15 +489,15 @@ impl<T, E, F: From<E>> ops::FromTryResidual<Result<!, E>> for Poll<Result<T, F>>
 ```
 
 ```rust
-impl<T, E> ops::Try for Poll<Option<Result<T, E>>> {
-    type Output = Poll<Option<T>>;
-    type Residual = <Result<T, E> as ops::Try>::Residual;
+impl<T, E> ops::EarlyExit for Poll<Option<Result<T, E>>> {
+    type Remainder = Poll<Option<T>>;
+    type Return = <Result<T, E> as ops::EarlyExit>::Return;
 
-    fn from_output(c: Self::Output) -> Self {
+    fn from_remainder(c: Self::Remainder) -> Self {
         c.map(|x| x.map(Ok))
     }
 
-    fn branch(self) -> ControlFlow<Self::Residual, Self::Output> {
+    fn branch(self) -> ControlFlow<Self::Return, Self::Remainder> {
         match self {
             Poll::Ready(Some(Ok(x))) => ControlFlow::Continue(Poll::Ready(Some(x))),
             Poll::Ready(Some(Err(e))) => ControlFlow::Break(Err(e)),
@@ -507,8 +507,8 @@ impl<T, E> ops::Try for Poll<Option<Result<T, E>>> {
     }
 }
 
-impl<T, E, F: From<E>> ops::FromTryResidual<Result<!, E>> for Poll<Option<Result<T, F>>> {
-    fn from_residual(x: Result<!, E>) -> Self {
+impl<T, E, F: From<E>> ops::FromReturn<Result<!, E>> for Poll<Option<Result<T, F>>> {
+    fn from_return(x: Result<!, E>) -> Self {
         match x {
             Err(e) => Poll::Ready(Some(Err(From::from(e)))),
         }
@@ -519,15 +519,15 @@ impl<T, E, F: From<E>> ops::FromTryResidual<Result<!, E>> for Poll<Option<Result
 ### `ControlFlow`
 
 ```rust
-impl<B, C> ops::Try for ControlFlow<B, C> {
-    type Output = C;
-    type Residual = ControlFlow<B, !>;
+impl<B, C> ops::EarlyExit for ControlFlow<B, C> {
+    type Remainder = C;
+    type Return = ControlFlow<B, !>;
 
-    fn from_output(c: C) -> Self {
+    fn from_remainder(c: C) -> Self {
         ControlFlow::Continue(c)
     }
 
-    fn branch(self) -> ControlFlow<Self::Residual, C> {
+    fn branch(self) -> ControlFlow<Self::Return, C> {
         match self {
             ControlFlow::Continue(c) => ControlFlow::Continue(c),
             ControlFlow::Break(b) => ControlFlow::Break(ControlFlow::Break(b)),
@@ -535,8 +535,8 @@ impl<B, C> ops::Try for ControlFlow<B, C> {
     }
 }
 
-impl<B, C> ops::FromTryResidual for ControlFlow<B, C> {
-    fn from_residual(x: <Self as ops::Try>::Residual) -> Self {
+impl<B, C> ops::FromReturn for ControlFlow<B, C> {
+    fn from_return(x: <Self as ops::EarlyExit>::Return) -> Self {
         match x {
             ControlFlow::Break(r) => ControlFlow::Break(r),
         }
@@ -557,11 +557,11 @@ mod sadness {
     #[derive(Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Debug, Hash)]
     pub struct PleaseCallTheOkOrMethodToUseQuestionMarkOnOptionsInAMethodThatReturnsResult;
 
-    impl<T, E> ops::FromTryResidual<Option<!>> for Result<T, E>
+    impl<T, E> ops::FromReturn<Option<!>> for Result<T, E>
     where
         E: From<PleaseCallTheOkOrMethodToUseQuestionMarkOnOptionsInAMethodThatReturnsResult>,
     {
-        fn from_residual(x: Option<!>) -> Self {
+        fn from_return(x: Option<!>) -> Self {
             match x {
                 None => Err(From::from(
                     PleaseCallTheOkOrMethodToUseQuestionMarkOnOptionsInAMethodThatReturnsResult,
@@ -580,7 +580,7 @@ fn try_fold<B, F, R>(&mut self, init: B, mut f: F) -> R
 where
     Self: Sized,
     F: FnMut(B, Self::Item) -> R,
-    R: Try<Output = B>,
+    R: EarlyExit<Remainder = B>,
 {
     let mut accum = init;
     while let Some(x) = self.next() {
@@ -700,7 +700,7 @@ So when thinking about `ControlFlow`, it's often best to think of it not like `R
 
 Interestingly, a [previous version](https://github.com/rust-lang/rfcs/blob/f89568b1fe5db4d01c4668e0d334d4a5abb023d8/text/0000-try-trait.md#using-an-associated-type-for-the-success-value) of RFC #1859 _did_ actually mention a two-trait solution, splitting the "associated type for ok" and "generic type for error" like is done here.  It's no longer  mentioned in the version that was merged.  To speculate, it may have been unpopular due to a thought that an extra traits just for the associated type wasn't worth it.
 
-Current desires for the solution, however, have more requirements than were included in the RFC at the time of that version.  Notably, the stabilized `Iterator::try_fold` method depends on being able to create a `Try` type from the accumulator.  Including such a constructor on the trait with the associated type helps that separate trait provide value.
+Current desires for the solution, however, have more requirements than were included in the RFC at the time of that version.  Notably, the stabilized `Iterator::try_fold` method depends on being able to create a `EarlyExit` type from the accumulator.  Including such a constructor on the trait with the associated type helps that separate trait provide value.
 
 Also, ok-wrapping was decided [in #70941](https://github.com/rust-lang/rust/issues/70941), which needs such a constructor, making this ["much more appealing"](https://github.com/rust-lang/rust/issues/42327#issuecomment-379882998).
 
@@ -724,38 +724,38 @@ Bikeshed away!
 
 Most importantly, for any type generic in its "output type" it's easy to produce a residual type using an uninhabited type.  That works for `Option` -- no `NoneError` residual type needed -- as well as for the `StrandFail<T>` type from the experience report.  And thanks to enum layout optimizations, there's no space overhead to doing this: `Option<!>` is a ZST, and `Result<!, E>` is no larger than `E` itself.  So most of the time one will not need to define anything additional.
 
-In those cases where a separate type *is* needed, it's still easier to make a residual type because they're transient and thus can be opaque: there's no point at which a user is expected to *do* anything with a residual type other than convert it back into a known `Try` type.  This is different from the previous design, where less-restrictive interconversion meant that anything could be exposed via a `Result`.  That has lead to requests, [such as for `NoneError` to implement `Error`](https://github.com/rust-lang/rust/issues/46871#issuecomment-618186642), that are perfectly understandable given that the instances are exposed in `Result`s.  As residual types aren't ever exposed like that, it would be fine for them to implement nothing but `FromTryResidual` (and probably `Debug`), making them cheap to define and maintain.
+In those cases where a separate type *is* needed, it's still easier to make a residual type because they're transient and thus can be opaque: there's no point at which a user is expected to *do* anything with a residual type other than convert it back into a known `EarlyExit` type.  This is different from the previous design, where less-restrictive interconversion meant that anything could be exposed via a `Result`.  That has lead to requests, [such as for `NoneError` to implement `Error`](https://github.com/rust-lang/rust/issues/46871#issuecomment-618186642), that are perfectly understandable given that the instances are exposed in `Result`s.  As residual types aren't ever exposed like that, it would be fine for them to implement nothing but `FromReturn` (and probably `Debug`), making them cheap to define and maintain.
 
 ## Use of `!`
 
-This RFC uses `!` to be concise.  It would work fine with `convert::Infallible` instead if `!` has not yet stabilized, though a few more match arms would be needed in the implementations.  (For example, `Option::from_residual` would need `Some(c) => match c {}`.)
+This RFC uses `!` to be concise.  It would work fine with `convert::Infallible` instead if `!` has not yet stabilized, though a few more match arms would be needed in the implementations.  (For example, `Option::from_return` would need `Some(c) => match c {}`.)
 
 ## Moving away from the `Option`→`Result` interconversion
 
 We could consider doing an edition switch to make this no longer allowed.
 
-For example, we could have a different, never-stable `Try`-like trait used in old editions for the `?` desugaring.  It could then have a blanket impl, plus the extra interconversion one.
+For example, we could have a different, never-stable `EarlyExit`-like trait used in old editions for the `?` desugaring.  It could then have a blanket impl, plus the extra interconversion one.
 
 It's unclear that that's worth the effort, however, so this RFC is currently written to continue to support it going forward.  Notably, removing it isn't enough to solve the annotation requirements, so the opportunity cost feels low.
 
-## Why `FromTryResidual` is the supertrait
+## Why `FromReturn` is the supertrait
 
-It's nicer for `try_fold` implementations to just mention the simpler `Try` name.  It being the subtrait means that code needing only the basic scenario can just bound on `Try` and know that both `from_output` and `from_residual` are available.
+It's nicer for `try_fold` implementations to just mention the simpler `EarlyExit` name.  It being the subtrait means that code needing only the basic scenario can just bound on `EarlyExit` and know that both `from_remainder` and `from_return` are available.
 
-## Default `Residual` on `FromTryResidual`
+## Default `Return` on `FromReturn`
 
 The default here is provided to make the basic case simple.  It means that when implementing the trait, the simple case (like in `Option`) doesn't need to think about it -- similar to how you can `impl Add for Foo` for the homogeneous case even though that trait also has a generic parameter.
 
-## `FromTryResidual::from_residual` vs `Residual::into_try`
+## `FromReturn::from_return` vs `Return::into_try`
 
-Either of these directions could be made to work.  Indeed, an early experiment while drafting this had a method on a required trait for the residual that created the type implementing `Try` (not just the associated type).  However that method was removed as unnecessary once `from_residual` was added, and then the whole trait was moved to future work in order to descope the RFC, as it proved unnecessary for the essential `?`/`try_fold` functionality.
+Either of these directions could be made to work.  Indeed, an early experiment while drafting this had a method on a required trait for the residual that created the type implementing `EarlyExit` (not just the associated type).  However that method was removed as unnecessary once `from_return` was added, and then the whole trait was moved to future work in order to descope the RFC, as it proved unnecessary for the essential `?`/`try_fold` functionality.
 
-A major advantage of the `FromTryResidual::from_residual` direction is that it's more flexible with coherence when it comes to allowing other things to be converted into a new type being defined.  That does come at the cost of higher restriction on allowing the new type to be converted into other things, but reusing a residual can also be used for that scenario.
+A major advantage of the `FromReturn::from_return` direction is that it's more flexible with coherence when it comes to allowing other things to be converted into a new type being defined.  That does come at the cost of higher restriction on allowing the new type to be converted into other things, but reusing a residual can also be used for that scenario.
 
-Converting a known residual into a generic `Try` type seems impossible (unless it's uninhabited), but consuming arbitrary residuals could work -- imagine something like
+Converting a known residual into a generic `EarlyExit` type seems impossible (unless it's uninhabited), but consuming arbitrary residuals could work -- imagine something like
 ```rust
-impl<R: std::fmt::Debug> FromTryResidual<R> for LogAndIgnoreErrors {
-    fn from_residual(h: H) -> Self {
+impl<R: std::fmt::Debug> FromReturn<R> for LogAndIgnoreErrors {
+    fn from_return(h: H) -> Self {
         dbg!(h);
         Self
     }
@@ -776,9 +776,9 @@ And, ignoring the coherence implications, a major difference between the two sid
 
 Previous approaches used on nightly
 - The original [`Carrier` trait](https://doc.rust-lang.org/1.16.0/core/ops/trait.Carrier.html)
-- The next design with a [`Try` trait](https://doc.rust-lang.org/1.32.0/core/ops/trait.Try.html) (different from the one here)
+- The next design with a [`EarlyExit` trait](https://doc.rust-lang.org/1.32.0/core/ops/trait.EarlyExit.html) (different from the one here)
 
-Thinking from the perspective of a [monad](https://doc.rust-lang.org/1.32.0/core/ops/trait.Try.html), `Try::from_output` is similar to `return`.
+Thinking from the perspective of a [monad](https://doc.rust-lang.org/1.32.0/core/ops/trait.EarlyExit.html), `EarlyExit::from_remainder` is similar to `return`.
 
 <!--
 Discuss prior art, both the good and the bad, in relation to this proposal.
@@ -799,7 +799,7 @@ Please also take into consideration that rust sometimes intentionally diverges f
 # Unresolved questions
 [unresolved-questions]: #unresolved-questions
 
-- Bikesheds: `Try`/`FromTryResidual`/`Try::Output`/`Try::Residual` all might have better names.  This RFC has left it as `Try` mostly because that meant not touching all the `try_fold` implementations in the prototype.  I've long liked [parasyte's "bubble" suggestion](https://internals.rust-lang.org/t/bikeshed-a-consise-verb-for-the-operator/7289/29?u=scottmcm) as a name, but maybe sticking with the previous one is best.
+- Bikesheds: `EarlyExit`/`FromReturn`/`EarlyExit::Remainder`/`EarlyExit::Return` all might have better names.  This RFC has left it as `EarlyExit` mostly because that meant not touching all the `try_fold` implementations in the prototype.  I've long liked [parasyte's "bubble" suggestion](https://internals.rust-lang.org/t/bikeshed-a-consise-verb-for-the-operator/7289/29?u=scottmcm) as a name, but maybe sticking with the previous one is best.
 - Structure: The three methods could be split up further
 
 <!--
@@ -815,31 +815,31 @@ While it isn't directly used in this RFC, a particular residual type can be used
 
 For example, one could define a trait like this one:
 ```rust
-pub trait GetCorrespondingTryType<TryOutputType>: Sized {
+pub trait GetCorrespondingEarlyExitType<EarlyExitRemainderType>: Sized {
     /// The type from the original type constructor that also has this residual type,
-    /// but has the specified Output type.
-    type TryType: Try<Output = TryOutputType, Residual = Self>;
+    /// but has the specified Remainder type.
+    type EarlyExitType: EarlyExit<Remainder = EarlyExitRemainderType, Return = Self>;
 }
 ```
 
 With corresponding simple implementations like these:
 ```rust
-impl<T> GetCorrespondingTryType<T> for Option<!> {
-    type TryType = Option<T>;
+impl<T> GetCorrespondingEarlyExitType<T> for Option<!> {
+    type EarlyExitType = Option<T>;
 }
 
-impl<C, B> ops::GetCorrespondingTryType<C> for ControlFlow<B, !> {
-    type TryType = ControlFlow<B, C>;
+impl<C, B> ops::GetCorrespondingEarlyExitType<C> for ControlFlow<B, !> {
+    type EarlyExitType = ControlFlow<B, C>;
 }
 ```
 
 And thus allow code to put whatever value they want into the appropriate type from the same family.
 
-This can be thought of as the type-level inverse of `Try`'s associated types: It splits them apart, and this puts them back together again.
+This can be thought of as the type-level inverse of `EarlyExit`'s associated types: It splits them apart, and this puts them back together again.
 
 (Why is this not written using Generic Associated Types (GATs)?  Because it allows implementations to work with only specific types, or with generic-but-bounded types.  Anything using it can bound to just the specific types needed for that method.)
 
-A previous version of this RFC included a trait along these lines, but it wasn't needed for the stable-at-time-of-writing scenarios.  Furthermore, some experiments demonstrated that having a bound in `Try` requiring it (something like `where Self::Residual: GetCorrespondingTryType<Self::Output>`) wasn't actually even helpful for unstable scenarios, so there was no need to include it in normative section of the RFC.
+A previous version of this RFC included a trait along these lines, but it wasn't needed for the stable-at-time-of-writing scenarios.  Furthermore, some experiments demonstrated that having a bound in `EarlyExit` requiring it (something like `where Self::Return: GetCorrespondingEarlyExitType<Self::Remainder>`) wasn't actually even helpful for unstable scenarios, so there was no need to include it in normative section of the RFC.
 
 ## Possibilities for `try_find`
 
@@ -850,18 +850,18 @@ That could be done with an implementation such as the following:
 fn try_find<F, R>(
     &mut self,
     f: F,
-) -> <R::Residual as ops::GetCorrespondingTryType<Option<Self::Item>>>::TryType
+) -> <R::Return as ops::GetCorrespondingEarlyExitType<Option<Self::Item>>>::EarlyExitType
 where
     Self: Sized,
     F: FnMut(&Self::Item) -> R,
-    R: ops::Try<Output = bool>,
-    R::Residual: ops::GetCorrespondingTryType<Option<Self::Item>>,
+    R: ops::EarlyExit<Remainder = bool>,
+    R::Return: ops::GetCorrespondingEarlyExitType<Option<Self::Item>>,
 {
     #[inline]
-    fn check<F, T, R>(mut f: F) -> impl FnMut((), T) -> ControlFlow<Result<T, R::Residual>>
+    fn check<F, T, R>(mut f: F) -> impl FnMut((), T) -> ControlFlow<Result<T, R::Return>>
     where
         F: FnMut(&T) -> R,
-        R: Try<Output = bool>,
+        R: EarlyExit<Remainder = bool>,
     {
         move |(), x| match f(&x).branch() {
             ControlFlow::Continue(false) => ControlFlow::Continue(()),
@@ -871,22 +871,22 @@ where
     }
 
     match self.try_fold((), check(f)) {
-        ControlFlow::Continue(()) => Try::from_output(None),
-        ControlFlow::Break(Ok(x)) => Try::from_output(Some(x)),
-        ControlFlow::Break(Err(r)) => <_>::from_residual(r),
+        ControlFlow::Continue(()) => EarlyExit::from_remainder(None),
+        ControlFlow::Break(Ok(x)) => EarlyExit::from_remainder(Some(x)),
+        ControlFlow::Break(Err(r)) => <_>::from_return(r),
     }
 }
 ```
 
-Similarly, it could allow `Try` to automatically provide an appropriate `map` method:
+Similarly, it could allow `EarlyExit` to automatically provide an appropriate `map` method:
 ```rust
-fn map<T>(self, f: impl FnOnce(Self::Output) -> T) -> <Self::Residual as GetCorrespondingTryType<T>>::TryType
+fn map<T>(self, f: impl FnOnce(Self::Remainder) -> T) -> <Self::Return as GetCorrespondingEarlyExitType<T>>::EarlyExitType
 where
-    Self::Residual: GetCorrespondingTryType<T>,
+    Self::Return: GetCorrespondingEarlyExitType<T>,
 {
     match self.branch() {
-        ControlFlow::Continue(c) => Try::from_output(f(c)),
-        ControlFlow::Break(r) => FromTryResidual::from_residual(r),
+        ControlFlow::Continue(c) => EarlyExit::from_remainder(f(c)),
+        ControlFlow::Break(r) => FromReturn::from_return(r),
     }
 }
 
@@ -907,28 +907,28 @@ let _ = try {
 
 This usually isn't a problem on stable, as the `?` usually has a contextual type from its function, but can still happen there in closures.
 
-But with something like `GetCorrespondingTryType`, an alternative desugaring becomes available which takes advantage of how the residual type preserves the "result-ness" (or whatever-ness) of the original value.  That might turn the block above into something like the following:
+But with something like `GetCorrespondingEarlyExitType`, an alternative desugaring becomes available which takes advantage of how the residual type preserves the "result-ness" (or whatever-ness) of the original value.  That might turn the block above into something like the following:
 ```rust
-fn helper<C, R: GetCorrespondingTryType<C>>(r: R) -> <R as GetCorrespondingTryType<C>>::TryType
+fn helper<C, R: GetCorrespondingEarlyExitType<C>>(r: R) -> <R as GetCorrespondingEarlyExitType<C>>::EarlyExitType
 {
-	FromTryResidual::from_residual(h)
+	FromReturn::from_return(h)
 }
 
 'block: {
-	foo(match Try::branch(x) {
+	foo(match EarlyExit::branch(x) {
 		ControlFlow::Continue(c) => c,
 		ControlFlow::Break(r) => break 'block helper(r),
 	});
-	bar(match Try::branch(y) {
+	bar(match EarlyExit::branch(y) {
 		ControlFlow::Continue(c) => c,
 		ControlFlow::Break(r) => break 'block helper(r),
 	});
-	Try::from_output(z)
+	EarlyExit::from_remainder(z)
 }
 ```
-(It's untested whether the inference engine is smart enough to pick the appropriate `C` with just that -- the `Output` associated type is constrained to have a `Continue` type matching the generic parameter, and that `Continue` type needs to match that of `z`, so it's possible.  But hopefully this communicates the idea, even if an actual implementation might need to more specifically introduce type variables or something.)
+(It's untested whether the inference engine is smart enough to pick the appropriate `C` with just that -- the `Remainder` associated type is constrained to have a `Continue` type matching the generic parameter, and that `Continue` type needs to match that of `z`, so it's possible.  But hopefully this communicates the idea, even if an actual implementation might need to more specifically introduce type variables or something.)
 
-That way it could compile so long as the `TryType`s of the residuals matched.  For example, [these uses in rustc](https://github.com/rust-lang/rust/blob/7cf205610e1310897f43b35713a42459e8b40c64/compiler/rustc_codegen_ssa/src/back/linker.rs#L529-L573) would work without the extra annotation.
+That way it could compile so long as the `EarlyExitType`s of the residuals matched.  For example, [these uses in rustc](https://github.com/rust-lang/rust/blob/7cf205610e1310897f43b35713a42459e8b40c64/compiler/rustc_codegen_ssa/src/back/linker.rs#L529-L573) would work without the extra annotation.
 
 Now, of course that wouldn't cover anything.  It wouldn't work with anything needing error conversion, for example, but annotation is also unavoidable in those cases -- there's no reasonable way for the compiler to pick "the" type into which all the errors are convertible.
 
@@ -938,21 +938,21 @@ So a future RFC could define a way (syntax, code inspection, heuristics, who kno
 
 ## Possibilities for `yeet`
 
-As previously mentioned, this RFC neither defines nor proposes a `yeet` operator.  However, like the previous design could support one with its `Try::from_error`, it's important that this design would be sufficient to support it.
+As previously mentioned, this RFC neither defines nor proposes a `yeet` operator.  However, like the previous design could support one with its `EarlyExit::from_error`, it's important that this design would be sufficient to support it.
 
 *`yeet` is a [bikeshed-avoidance](https://twitter.com/josh_triplett/status/1248658754976927750) name for `throw`/`fail`/`raise`/etc, used because it definitely won't be the final keyword.*
 
 Because this "residual" design carries along the "result-ness" or "option-ness" or similar, it means there are two possibilities for a desugaring.
 
-- It could directly take the residual type, so `yeet e` would desugar directly to `FromTryResidual::from_residual(e)`.
-- It could put the argument into a special residual type, so `yeet e` would desugar to something like `FromTryResidual::from_residual(Yeeted(e))`.
+- It could directly take the residual type, so `yeet e` would desugar directly to `FromReturn::from_return(e)`.
+- It could put the argument into a special residual type, so `yeet e` would desugar to something like `FromReturn::from_return(Yeeted(e))`.
 
 These have various implications -- like `yeet None`/`yeet`, `yeet Err(ErrorKind::NotFound)`/`yeet ErrorKind::NotFound.into()`, etc -- but thankfully this RFC doesn't need to discuss those.  (And please don't do so in the GitHub comments either, to keep things focused, though feel free to start an IRLO or Zulip thread if you're so inspired.)
 
 <!--
 Think about what the natural extension and evolution of your proposal would
 be and how it would affect the language and project as a whole in a holistic
-way. Try to use this section as a tool to more fully consider all possible
+way. EarlyExit to use this section as a tool to more fully consider all possible
 interactions with the project and language in your proposal.
 Also consider how this all fits into the roadmap for the project
 and of the relevant sub-team.
