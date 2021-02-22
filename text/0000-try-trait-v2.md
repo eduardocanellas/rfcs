@@ -81,8 +81,8 @@ The `ops::EarlyExit` trait describes a type's behavior when used with the `?` op
 
 At its core, the `?` operator is about splitting a type into its two parts:
 
-- The *output* that will be returned from the `?` expression, with which the program will continue, and
-- The *residual* that will be returned to the calling code, as an early exit from the normal flow.
+- The *remainder* that will be returned from the `?` expression, with which the program will continue, and
+- The *return* that will be returned to the calling code, as an early exit from the normal flow.
 
 (Oxford's definition for a residual is "a quantity remaining after other things have been subtracted or allowed for", thus the use here.)
 
